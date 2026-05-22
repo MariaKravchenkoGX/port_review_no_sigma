@@ -14,15 +14,23 @@ from __future__ import annotations
 import os
 import re
 import glob
+import logging
+import shutil
 from datetime import date, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 import snowflake.connector
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
+from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.offsets import CustomBusinessDay
+
+
+US_BD = CustomBusinessDay(calendar=USFederalHolidayCalendar())
+log = logging.getLogger(__name__)
 
 
 # ===========================================================================
@@ -47,6 +55,16 @@ BNY_CUSTODY_DIR = BASE_DIR / "BNY Custody"
 BBH_CUSTODY_DIR = BASE_DIR / "BBH Custody"
 
 MAP_FUND_PATH = Path(r"X:\PM & Operations\Projects\py\data_fields\custom\mapFUND.csv")
+
+REPORT_OUTPUT_DIR = Path(r"X:\PM & Operations\Portfolio Management\Portfolio Review")
+REPORT_TEMPLATE_PATH = (
+    REPORT_OUTPUT_DIR / "Automated Reports" / "Port_Review_Master_Template.xlsx"
+)
+REPORT_ARCHIVE_DIR = REPORT_TEMPLATE_PATH.parent / "Archive"
+MY_RUNS_CSV_PATH = Path(
+    r"X:\PM & Operations\Portfolio Management\Portfolio Model Macros"
+    r"\Bulk_Updater_2026\my_runs.csv"
+)
 
 # Output columns in exact order (matches template)
 OUTPUT_COLUMNS = [
@@ -93,6 +111,21 @@ REINVEST_CUSTODY_CASH_ADJ_THRESHOLD = 0.0010  # 10 bps
 REINVEST_NET_CASH_FUTURES_ADJ_THRESHOLD = 0.0015  # 15 bps
 RAISE_CUSTODY_CASH_ADJ_THRESHOLD = -0.0004  # -4 bps
 
+EXCLUDED_FLAG_ATTRIBUTES = {"OPTIONS", "FI / DERIVS", "FI/DERIVS"}
+
+DIVIDEND_TERMS = ["dvd", "dvds", "dividend", "dvd pmt", "div"]
+REINVESTMENT_TERMS = ["reinv", "reinvestment"]
+RAISE_TERMS = ["raise"]
+TRIM_TERMS = ["trim"]
+SUPPRESSION_CATEGORIES = [
+    (DIVIDEND_TERMS, "Dividend-related"),
+    (REINVESTMENT_TERMS, "Reinvestment"),
+    (RAISE_TERMS, "Raise"),
+    (TRIM_TERMS, "Trim"),
+]
+COMMENT_EXPIRY_BD = 6
+COMMENT_DATE_RE = re.compile(r"^(\d{1,2})/(\d{1,2})\b")
+
 
 # ===========================================================================
 # HELPERS
@@ -118,6 +151,341 @@ def _sf_connect():
         role="",
         ocsp_fail_open=True,
     )
+
+
+def previous_business_day(d: date) -> date:
+    """Return the most recent US business day before d."""
+    return (pd.Timestamp(d) - US_BD).date()
+
+
+def _first_existing_column(df: pd.DataFrame, *names: str) -> Optional[str]:
+    """Find a column by exact name first, then by case/spacing-insensitive name."""
+    for name in names:
+        if name in df.columns:
+            return name
+
+    normalized = {
+        str(col).strip().lower().replace("_", " "): col
+        for col in df.columns
+    }
+    for name in names:
+        col = normalized.get(name.strip().lower().replace("_", " "))
+        if col is not None:
+            return col
+    return None
+
+
+def detect_flagged_funds(df: pd.DataFrame) -> List[str]:
+    """Return flagged tickers, excluding attributes that should not run macros."""
+    ticker_col = _first_existing_column(df, "Fund Ticker", "FUND_TICKER")
+    reinvest_col = _first_existing_column(df, "Reinvest Flag", "REINVEST_FLAG")
+    raise_col = _first_existing_column(df, "Raise Flag", "RAISE_FLAG")
+    attr_col = _first_existing_column(df, "Attribute", "ATTRIBUTE")
+
+    if df.empty or ticker_col is None or reinvest_col is None or raise_col is None:
+        return []
+
+    mask = (
+        df[reinvest_col].astype(str).str.strip().str.lower().eq("flag")
+        | df[raise_col].astype(str).str.strip().str.lower().eq("flag")
+    )
+
+    if attr_col is not None:
+        attr_key = df[attr_col].astype(str).str.strip().str.upper()
+        mask = mask & ~attr_key.isin(EXCLUDED_FLAG_ATTRIBUTES)
+
+    return df.loc[mask, ticker_col].dropna().astype(str).str.strip().unique().tolist()
+
+
+def archive_and_write_runs_csv(
+    csv_path: Path,
+    archive_dir: Path,
+    flagged_tickers: List[str],
+    asof_date: date,
+) -> Path:
+    """Archive existing my_runs.csv, then write the current flagged ticker list."""
+    csv_path = Path(csv_path)
+    archive_dir = Path(archive_dir)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    if csv_path.exists():
+        archive_name = f"my_runs_{asof_date.strftime('%Y%m%d')}.csv"
+        shutil.copy2(csv_path, archive_dir / archive_name)
+
+    date_str = f"{asof_date.month}/{asof_date.day}/{asof_date.year}"
+    rows = [
+        {
+            "run_id": "",
+            "fund": ticker,
+            "asof_date": date_str,
+            "index_date": "",
+            "pro_forma_date": "",
+            "source_report": "Portfolio Review",
+        }
+        for ticker in flagged_tickers
+    ]
+    out = pd.DataFrame(
+        rows,
+        columns=[
+            "run_id",
+            "fund",
+            "asof_date",
+            "index_date",
+            "pro_forma_date",
+            "source_report",
+        ],
+    )
+    out.to_csv(csv_path, index=False)
+    return csv_path
+
+
+def parse_comment_date(comment: str, year: Optional[int] = None) -> Optional[date]:
+    """Extract a leading m/d date from a comment, using the provided/current year."""
+    if not comment:
+        return None
+    match = COMMENT_DATE_RE.match(str(comment).strip())
+    if not match:
+        return None
+    try:
+        return date(year or date.today().year, int(match.group(1)), int(match.group(2)))
+    except ValueError:
+        return None
+
+
+def check_comment_staleness(
+    ticker: str,
+    comment_date: date,
+    today: date,
+    threshold_bd: int = 5,
+) -> bool:
+    """Log whether a dated comment is older than the threshold in business days."""
+    bd_count = int(np.busday_count(comment_date, today))
+    if bd_count > threshold_bd:
+        log.warning(
+            "Stale comment for %s: dated %s (%d business days old, threshold=%d)",
+            ticker,
+            comment_date.strftime("%m/%d"),
+            bd_count,
+            threshold_bd,
+        )
+        return True
+    return False
+
+
+def read_comments_from_report(
+    report_path: Path,
+    ticker_col: str = "A",
+    comment_col: str = "AA",
+    sheet_name: str = "Port Review Master Table",
+) -> Dict[str, str]:
+    """Read column comments keyed by ticker from an existing Port Review workbook."""
+    import openpyxl
+
+    report_path = Path(report_path) if report_path is not None else None
+    if report_path is None or not report_path.exists():
+        if report_path is not None:
+            log.info("Report not found for comment reading: %s", report_path)
+        return {}
+
+    wb = None
+    try:
+        wb = openpyxl.load_workbook(str(report_path), data_only=True)
+        sheet = wb[sheet_name] if sheet_name in wb.sheetnames else wb.worksheets[0]
+
+        result = {}
+        for row_num in range(2, 1001):
+            ticker_val = sheet[f"{ticker_col}{row_num}"].value
+            comment_val = sheet[f"{comment_col}{row_num}"].value
+            if ticker_val and comment_val:
+                result[str(ticker_val).strip().upper()] = str(comment_val).strip()
+        return result
+    except Exception as exc:
+        log.warning("Failed to read comments from %s: %s", report_path, exc)
+        return {}
+    finally:
+        if wb is not None:
+            wb.close()
+
+
+def filter_flagged_by_comments(
+    flagged_tickers: List[str],
+    prev_report_path: Optional[Path],
+    asof_date: date,
+) -> List[str]:
+    """Remove flagged tickers suppressed by prior-day comments."""
+    if not flagged_tickers:
+        return []
+
+    if prev_report_path is None:
+        log.info("No previous report available; skipping comment filter")
+        return list(flagged_tickers)
+
+    comments = read_comments_from_report(prev_report_path)
+    if not comments:
+        log.info("No comments found; returning all flagged tickers unfiltered")
+        return list(flagged_tickers)
+
+    filtered = []
+    for ticker in flagged_tickers:
+        comment = comments.get(str(ticker).upper(), "")
+        if not comment:
+            filtered.append(ticker)
+            continue
+
+        comment_dt = parse_comment_date(comment, year=asof_date.year)
+        if comment_dt is not None:
+            check_comment_staleness(ticker, comment_dt, asof_date)
+
+        comment_lower = comment.lower()
+        suppressed = False
+        for terms, reason in SUPPRESSION_CATEGORIES:
+            if any(term.lower() in comment_lower for term in terms):
+                log.info(
+                    "Suppressed %s from my_runs.csv: %s (comment: %s)",
+                    ticker,
+                    reason,
+                    comment,
+                )
+                suppressed = True
+                break
+
+        if not suppressed:
+            filtered.append(ticker)
+
+    log.info(
+        "Comment filter: %d flagged -> %d after suppression (%d removed)",
+        len(flagged_tickers),
+        len(filtered),
+        len(flagged_tickers) - len(filtered),
+    )
+    return filtered
+
+
+def carry_forward_comments(
+    prev_report_path: Optional[Path],
+    output_path: Path,
+    asof_date: date,
+    comment_col: str = "AA",
+) -> int:
+    """Copy prior report comments into today's report, expiring stale dated notes."""
+    import openpyxl
+
+    if prev_report_path is None:
+        log.info("No previous report for comment carry-forward")
+        return 0
+
+    prev_report_path = Path(prev_report_path)
+    output_path = Path(output_path)
+
+    if not prev_report_path.exists():
+        log.info("No previous report for comment carry-forward: %s", prev_report_path.name)
+        return 0
+    if not output_path.exists():
+        log.warning("Today's report not found for comment carry-forward: %s", output_path.name)
+        return 0
+
+    prev_wb = None
+    today_wb = None
+    try:
+        prev_wb = openpyxl.load_workbook(str(prev_report_path), data_only=True)
+        prev_sheet = (
+            prev_wb["Port Review Master Table"]
+            if "Port Review Master Table" in prev_wb.sheetnames
+            else prev_wb.worksheets[0]
+        )
+
+        comments = []
+        for row_num in range(2, 1001):
+            comments.append(prev_sheet[f"{comment_col}{row_num}"].value)
+
+        while comments and comments[-1] is None:
+            comments.pop()
+
+        if not comments or all(c is None for c in comments):
+            log.info("No comments found in column %s of %s", comment_col, prev_report_path.name)
+            return 0
+
+        expired_count = 0
+        for i, val in enumerate(comments):
+            if val is None:
+                continue
+            comment_dt = parse_comment_date(str(val), year=asof_date.year)
+            if comment_dt is None:
+                continue
+            bd_age = int(np.busday_count(comment_dt, asof_date))
+            if bd_age > COMMENT_EXPIRY_BD:
+                log.info(
+                    "Expired comment (row %d): dated %s, %d BD old; not carried forward",
+                    i + 2,
+                    comment_dt.strftime("%m/%d"),
+                    bd_age,
+                )
+                comments[i] = None
+                expired_count += 1
+
+        if expired_count:
+            log.info("Expired %d stale comment(s) during carry-forward", expired_count)
+
+        today_wb = openpyxl.load_workbook(str(output_path))
+        today_sheet = (
+            today_wb["Port Review Master Table"]
+            if "Port Review Master Table" in today_wb.sheetnames
+            else today_wb.worksheets[0]
+        )
+
+        for i, val in enumerate(comments):
+            today_sheet[f"{comment_col}{i + 2}"].value = val
+
+        today_wb.save(str(output_path))
+        carried = sum(1 for c in comments if c is not None)
+        log.info(
+            "Carried forward %d comment(s) from %s (column %s)",
+            carried,
+            prev_report_path.name,
+            comment_col,
+        )
+        return carried
+    except Exception as exc:
+        log.warning("Comment carry-forward failed: %s", exc)
+        return 0
+    finally:
+        if prev_wb is not None:
+            prev_wb.close()
+        if today_wb is not None:
+            today_wb.close()
+
+
+def _dated_report_key(path: Path) -> str:
+    match = re.search(r"Port_Review_(\d{8})\.xlsx$", path.name)
+    return match.group(1) if match else ""
+
+
+def _find_prev_report_for_comments(
+    output_dir: Path,
+    archive_dir: Path,
+    today: date,
+) -> Optional[Path]:
+    """Locate the previous report in the output folder, then in the archive."""
+    output_dir = Path(output_dir)
+    archive_dir = Path(archive_dir)
+
+    prev_bd = previous_business_day(today)
+    prev_filename = f"Port_Review_{prev_bd.strftime('%Y%m%d')}.xlsx"
+    prev_path = output_dir / prev_filename
+    if prev_path.exists():
+        return prev_path
+
+    if archive_dir.exists():
+        today_key = today.strftime("%Y%m%d")
+        candidates = [
+            p for p in archive_dir.glob("Port_Review_*.xlsx")
+            if _dated_report_key(p) and _dated_report_key(p) < today_key
+        ]
+        if candidates:
+            return sorted(candidates, key=_dated_report_key, reverse=True)[0]
+
+    return None
 
 
 def _find_sei_folder(report_date: date) -> Path:
@@ -2130,10 +2498,7 @@ def write_to_template(df: pd.DataFrame, output_path: Path,
     import openpyxl
 
     if template_path is None:
-        template_path = Path(
-            r"X:\PM & Operations\Portfolio Management\Portfolio Review"
-            r"\Automated Reports\Port_Review_Master_Template.xlsx"
-        )
+        template_path = REPORT_TEMPLATE_PATH
 
     if not template_path.exists():
         raise FileNotFoundError(f"Template not found: {template_path}")
@@ -2220,6 +2585,11 @@ def write_to_template(df: pd.DataFrame, output_path: Path,
 
 if __name__ == "__main__":
     import argparse
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
     parser = argparse.ArgumentParser(description="Build Port Review from local files")
     parser.add_argument("--date", type=str, default=None,
@@ -2232,6 +2602,12 @@ if __name__ == "__main__":
                              "Port_Review_YYYYMMDD.xlsx in current directory.")
     parser.add_argument("--no-excel", action="store_true",
                         help="Skip Excel output (only print summary or save CSV)")
+    parser.add_argument("--runs-csv", type=str, default=str(MY_RUNS_CSV_PATH),
+                        help="Path to my_runs.csv for flagged tickers")
+    parser.add_argument("--no-runs-csv", action="store_true",
+                        help="Skip my_runs.csv generation")
+    parser.add_argument("--no-comments", action="store_true",
+                        help="Skip previous-report comment suppression and carry-forward")
     args = parser.parse_args()
 
     if args.date:
@@ -2239,15 +2615,46 @@ if __name__ == "__main__":
     else:
         run_date = date.today()
 
+    excel_path = None
+    if not args.no_excel:
+        excel_path = Path(args.excel) if args.excel else Path.cwd() / f"Port_Review_{run_date.strftime('%Y%m%d')}.xlsx"
+
+    prev_report = None
+    if not args.no_comments:
+        report_dir = excel_path.parent if excel_path is not None else Path.cwd()
+        prev_report = _find_prev_report_for_comments(report_dir, REPORT_ARCHIVE_DIR, run_date)
+        if prev_report is not None:
+            print(f"[OK] Previous report for comments: {prev_report.name}")
+        else:
+            print("[INFO] No previous report found for comments")
+
     df = build_port_review(run_date)
 
     if args.output:
         df.to_csv(args.output, index=False)
         print(f"[OK] Saved CSV to {args.output}")
 
+    flagged = detect_flagged_funds(df)
+    if not args.no_comments:
+        flagged = filter_flagged_by_comments(flagged, prev_report, run_date)
+    print(f"[INFO] Flagged funds for my_runs.csv: {flagged if flagged else 'None'}")
+
+    if not args.no_runs_csv:
+        runs_csv_path = archive_and_write_runs_csv(
+            Path(args.runs_csv),
+            REPORT_ARCHIVE_DIR,
+            flagged,
+            run_date,
+        )
+        print(f"[OK] my_runs.csv updated with {len(flagged)} flagged ticker(s): {runs_csv_path}")
+
     # Default behavior: write Excel to current working directory unless --no-excel
-    if not args.no_excel:
-        excel_path = args.excel
-        if excel_path is None:
-            excel_path = Path.cwd() / f"Port_Review_{run_date.strftime('%Y%m%d')}.xlsx"
-        write_to_template(df, Path(excel_path))
+    if excel_path is not None:
+        output_path = write_to_template(df, Path(excel_path))
+        if not args.no_comments:
+            carried = carry_forward_comments(prev_report, output_path, run_date, comment_col="AA")
+            if carried:
+                source_name = prev_report.name if prev_report is not None else "previous report"
+                print(f"[OK] Carried forward {carried} comment(s) from {source_name}")
+            else:
+                print("[INFO] No comments to carry forward")
