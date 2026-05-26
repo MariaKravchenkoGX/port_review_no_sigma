@@ -2801,7 +2801,8 @@ if __name__ == "__main__":
                     f"Port_Review_{run_date.strftime('%Y%m%d')}{excel_path.suffix or '.xlsx'}"
                 )
         else:
-            excel_path = Path.cwd() / f"Port_Review_{run_date.strftime('%Y%m%d')}.xlsx"
+            # Default: save to the shared Portfolio Review folder
+            excel_path = REPORT_OUTPUT_DIR / f"Port_Review_{run_date.strftime('%Y%m%d')}.xlsx"
 
     prev_report = None
     if not args.no_comments:
