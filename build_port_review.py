@@ -56,6 +56,16 @@ BBH_CUSTODY_DIR = BASE_DIR / "BBH Custody"
 
 MAP_FUND_PATH = Path(r"X:\PM & Operations\Projects\py\data_fields\custom\mapFUND.csv")
 
+# Index Files (used to populate Index Cash for PFFV / PFFD)
+INDEX_FILES_ROOT = Path(
+    r"X:\PM & Operations\Portfolio Management\Daily Files\000 Raw Data\Index Files"
+)
+# Fund -> filename glob for index cash lookup
+INDEX_CASH_SOURCES = {
+    "PFFV": "PFTF_daily_*.csv",
+    "PFFD": "PLCR_daily_*.csv",
+}
+
 REPORT_OUTPUT_DIR = Path(r"X:\PM & Operations\Portfolio Management\Portfolio Review")
 REPORT_TEMPLATE_PATH = (
     REPORT_OUTPUT_DIR / "Automated Reports" / "Port_Review_Master_Template.xlsx"
@@ -87,6 +97,7 @@ OUTPUT_COLUMNS = [
     "Custody Cash (USD) - Adj",
     "Actual Cash",
     "Accrued Cash",
+    "Index Cash",
     "Net Cash",
     "Net Cash (Futures Adj)",
     "Rank 1",
@@ -1709,7 +1720,11 @@ def _build_weight_comparison(
 
 
 def _rank_display_ticker(row: pd.Series) -> str:
-    """Return the display label used for rank rows."""
+    """Return the display label used for rank rows.
+
+    Falls back to security_description when no ticker is available
+    (e.g. treasuries, bonds, mortgages).
+    """
     sec_type = "" if pd.isna(row.get("security_type")) else str(row.get("security_type")).strip()
     if sec_type == "Future (New)":
         return ""
@@ -1722,12 +1737,6 @@ def _rank_display_ticker(row: pd.Series) -> str:
 
     desc = row.get("security_description")
     desc = "" if pd.isna(desc) else str(desc).strip()
-    if (
-        sec_type.startswith("Treasury")
-        or "Bond" in sec_type
-        or sec_type == "Inflation Indexed"
-    ):
-        return ""
     return desc
 
 
@@ -2230,6 +2239,70 @@ def compute_net_cash(holdings: pd.DataFrame, fund_mapping: pd.DataFrame) -> pd.D
     return net_cash
 
 
+# ===========================================================================
+# INDEX CASH (PFFV / PFFD)
+# ===========================================================================
+
+def _latest_index_files_folder(root: Path) -> Optional[Path]:
+    """Return the most recent 'Index Files YYYY-MM-DD' subfolder, or None."""
+    if not root.exists():
+        return None
+    folders = [
+        p for p in root.iterdir()
+        if p.is_dir() and re.match(r"Index Files \d{4}-\d{2}-\d{2}$", p.name)
+    ]
+    if not folders:
+        return None
+    folders.sort(key=lambda p: p.name, reverse=True)
+    return folders[0]
+
+
+def _read_index_cash(folder: Path, pattern: str) -> float:
+    """Find the CASH row in the index file and return its weighting as a decimal."""
+    matches = sorted(folder.glob(pattern), reverse=True)
+    if not matches:
+        log.info("No index file for pattern %s in %s", pattern, folder.name)
+        return 0.0
+    try:
+        df = pd.read_csv(matches[0], dtype=str)
+    except Exception as exc:
+        log.warning("Failed to read %s: %s", matches[0].name, exc)
+        return 0.0
+    desc_col = next((c for c in ("Description", "Ticker") if c in df.columns), None)
+    if desc_col is None:
+        return 0.0
+    cash_rows = df[df[desc_col].astype(str).str.strip().str.upper() == "CASH"]
+    if cash_rows.empty:
+        return 0.0
+    for col in ("Index Weighting", "Mkt % Index Wght"):
+        if col in cash_rows.columns:
+            try:
+                return float(cash_rows.iloc[0][col])
+            except (TypeError, ValueError):
+                continue
+    return 0.0
+
+
+def load_index_cash(
+    fund_tickers,
+    index_files_root: Path = INDEX_FILES_ROOT,
+) -> Dict[str, float]:
+    """Return {ticker: index_cash_value} for tickers in INDEX_CASH_SOURCES."""
+    folder = _latest_index_files_folder(index_files_root)
+    if folder is None:
+        log.warning("No 'Index Files YYYY-MM-DD' folder found under %s", index_files_root)
+        return {}
+    log.info("Using index files folder: %s", folder.name)
+    out: Dict[str, float] = {}
+    for ticker in fund_tickers:
+        pattern = INDEX_CASH_SOURCES.get(ticker)
+        if pattern is None:
+            continue
+        out[ticker] = _read_index_cash(folder, pattern)
+        log.info("Index Cash for %s = %s", ticker, out[ticker])
+    return out
+
+
 def build_port_review(report_date: Optional[date] = None) -> pd.DataFrame:
     """
     Build the Port Review DataFrame from local files + Snowflake index.
@@ -2465,6 +2538,10 @@ def build_port_review(report_date: Optional[date] = None) -> pd.DataFrame:
         "",
     )
 
+    # --- Add Index Cash column for PFFV / PFFD ---
+    idx_cash_map = load_index_cash(list(INDEX_CASH_SOURCES.keys()))
+    result["Index Cash"] = result["Fund Ticker"].map(idx_cash_map).fillna("")
+
     # --- Reorder columns ---
     result["Comment"] = ""  # Populated by carry-forward logic in the automation script
     for col in OUTPUT_COLUMNS:
@@ -2543,6 +2620,7 @@ def write_to_template(df: pd.DataFrame, output_path: Path,
         "Accrued Cash": pct_fmt,
         "Net Cash": pct_fmt,
         "Net Cash (Futures Adj)": pct_fmt,
+        "Index Cash": pct_fmt,
     }
 
     # --- Clear existing data rows ---
@@ -2557,8 +2635,72 @@ def write_to_template(df: pd.DataFrame, output_path: Path,
     headers = [c.value for c in sheet[1]]
     df_cols = list(df.columns)
 
-    # Map header -> column index
+    # Map header -> column index from the template
     header_to_col = {h: i + 1 for i, h in enumerate(headers) if h}
+
+    # Reorder template headers to match the DataFrame's column order.
+    # If the DataFrame inserts a new column (e.g. "Index Cash") between existing
+    # ones, shift later template columns to the right and add the new header.
+    desired_order = [c for c in df_cols]
+    final_headers = []
+    seen = set()
+    for col in desired_order:
+        final_headers.append(col)
+        seen.add(col)
+    for h in headers:
+        if h and h not in seen:
+            final_headers.append(h)
+            seen.add(h)
+
+    # Snapshot the original column widths and header cell styling so we can
+    # reapply them in the new positions instead of losing them when we wipe.
+    from openpyxl.utils import get_column_letter
+    from copy import copy as _copy
+    from openpyxl.styles import Font, Alignment
+
+    template_header_style = {}
+    template_col_widths = {}
+    for i, h in enumerate(headers):
+        if h is None:
+            continue
+        src = sheet.cell(row=1, column=i + 1)
+        template_header_style[h] = {
+            "font": _copy(src.font),
+            "fill": _copy(src.fill),
+            "alignment": _copy(src.alignment),
+            "border": _copy(src.border),
+            "number_format": src.number_format,
+        }
+        letter = get_column_letter(i + 1)
+        cd = sheet.column_dimensions.get(letter)
+        if cd is not None:
+            template_col_widths[h] = cd.width
+
+    # Wipe row 1 and rewrite headers in the new order
+    for c in range(1, max(sheet.max_column, len(final_headers)) + 1):
+        sheet.cell(row=1, column=c).value = None
+    for i, h in enumerate(final_headers, start=1):
+        cell = sheet.cell(row=1, column=i)
+        cell.value = h
+        # Reapply original styling (preserves theme color fills like the green
+        # on Rank 1/2/3). For headers that didn't exist in the template
+        # (e.g. "Index Cash"), just bold + center.
+        style = template_header_style.get(h)
+        if style is not None:
+            cell.font = style["font"]
+            cell.fill = style["fill"]
+            cell.alignment = style["alignment"]
+            cell.border = style["border"]
+        else:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center")
+
+        # Reapply column width
+        letter = get_column_letter(i)
+        if h in template_col_widths and template_col_widths[h] is not None:
+            sheet.column_dimensions[letter].width = template_col_widths[h]
+
+    header_to_col = {h: i + 1 for i, h in enumerate(final_headers)}
 
     for row_idx, (_, row) in enumerate(df.iterrows(), start=2):
         for header, col_idx in header_to_col.items():
@@ -2571,6 +2713,37 @@ def write_to_template(df: pd.DataFrame, output_path: Path,
                 # Apply column-specific number format
                 if header in column_formats:
                     cell.number_format = column_formats[header]
+
+    # --- Column groupings ---
+    # Clear any existing groupings inherited from the template, then group
+    # specific column ranges per spec:
+    #   G–L  (cash detail block 1)
+    #   N–P  (pending block)
+    #   R–S  (actual / accrued cash)
+    #   Reinvest Flag, Raise Flag
+    from openpyxl.utils import get_column_letter, column_index_from_string
+    for letter, dim in list(sheet.column_dimensions.items()):
+        if dim.outlineLevel:
+            dim.outlineLevel = 0
+            dim.hidden = False
+
+    grouped_letter_ranges = [("G", "L"), ("N", "P"), ("R", "S")]
+    for start, end in grouped_letter_ranges:
+        s_idx = column_index_from_string(start)
+        e_idx = column_index_from_string(end)
+        for idx in range(s_idx, e_idx + 1):
+            letter = get_column_letter(idx)
+            sheet.column_dimensions[letter].outlineLevel = 1
+            sheet.column_dimensions[letter].hidden = True
+
+    flag_cols = ["Reinvest Flag", "Raise Flag"]
+    for col_name in flag_cols:
+        if col_name in header_to_col:
+            letter = get_column_letter(header_to_col[col_name])
+            sheet.column_dimensions[letter].outlineLevel = 1
+            sheet.column_dimensions[letter].hidden = True
+
+    sheet.sheet_properties.outlinePr.summaryRight = True
 
     wb.save(str(output_path))
     wb.close()
@@ -2617,7 +2790,18 @@ if __name__ == "__main__":
 
     excel_path = None
     if not args.no_excel:
-        excel_path = Path(args.excel) if args.excel else Path.cwd() / f"Port_Review_{run_date.strftime('%Y%m%d')}.xlsx"
+        if args.excel:
+            excel_path = Path(args.excel)
+            # If user passed a directory, append the dated filename
+            if excel_path.exists() and excel_path.is_dir():
+                excel_path = excel_path / f"Port_Review_{run_date.strftime('%Y%m%d')}.xlsx"
+            # If user passed a path missing the date, append the date before the suffix
+            elif "Port_Review_" not in excel_path.name and run_date.strftime("%Y%m%d") not in excel_path.name:
+                excel_path = excel_path.with_name(
+                    f"Port_Review_{run_date.strftime('%Y%m%d')}{excel_path.suffix or '.xlsx'}"
+                )
+        else:
+            excel_path = Path.cwd() / f"Port_Review_{run_date.strftime('%Y%m%d')}.xlsx"
 
     prev_report = None
     if not args.no_comments:
